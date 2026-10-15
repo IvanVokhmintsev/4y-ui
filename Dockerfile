@@ -30,6 +30,15 @@ ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
 RUN go build -ldflags "-w -s" -o build/x-ui main.go
 RUN ./DockerInit.sh "$TARGETARCH"
 
+# awg(8) drives the host amneziawg module when XUI_AWG_BACKEND=kernel.
+# Pinned to the 3.1 tools release that matches the panel's obfuscation set.
+ARG AWG_TOOLS_REF=v3.1.20260812
+RUN apk add --no-cache git linux-headers \
+    && git clone --depth 1 --branch "$AWG_TOOLS_REF" https://github.com/amnezia-vpn/amneziawg-tools.git /tmp/awg-tools \
+    && make -C /tmp/awg-tools/src \
+    && install -m 755 /tmp/awg-tools/src/wg /usr/local/bin/awg \
+    && rm -rf /tmp/awg-tools
+
 # ========================================================
 # Stage: Final Image of 3x-ui
 # ========================================================
@@ -43,9 +52,12 @@ RUN apk add --no-cache --update \
   fail2ban \
   bash \
   curl \
-  openssl
+  openssl \
+  iproute2 \
+  nftables
 
 COPY --from=builder /app/build/ /app/
+COPY --from=builder /usr/local/bin/awg /usr/bin/awg
 COPY --from=builder /app/DockerEntrypoint.sh /app/
 COPY --from=builder /app/x-ui.sh /usr/bin/x-ui
 COPY --from=builder /app/internal/web/translation /app/internal/web/translation

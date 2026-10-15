@@ -46,6 +46,7 @@ type Desired struct {
 // place or needs to rebuild it from scratch.
 type managed struct {
 	dev          *Device
+	kern         *kernelInbound
 	udpRelay     *UDPRelay
 	portForwards *PortForwardSet
 	peers        atomic.Pointer[PeerIndex]
@@ -71,7 +72,13 @@ func (m *managed) handleUDP(src, dst netip.AddrPort, payload []byte) {
 }
 
 func (m *managed) close() {
-	m.portForwards.Close()
+	if m.portForwards != nil {
+		m.portForwards.Close()
+	}
+	if m.kern != nil {
+		m.kern.close()
+		return
+	}
 	// Stop packet delivery before closing the relay so an in-flight handler
 	// cannot publish a new session after the relay has already been swept.
 	m.dev.Close()
@@ -131,6 +138,13 @@ func (m *Manager) Ensure(d Desired) error {
 // at netstack-construction time, so the only option is closing the old
 // Device and building a fresh one).
 func (m *Manager) ensureLocked(d Desired) error {
+	backend, err := detectBackend()
+	if err != nil {
+		return err
+	}
+	if backend == BackendKernel {
+		return m.ensureKernelLocked(d)
+	}
 	inst, opts := d.Instance, d.Options
 	if opts.Logger == nil {
 		opts.Logger = verboseLoggerIfEnabled(inst.Id)
@@ -138,6 +152,12 @@ func (m *Manager) ensureLocked(d Desired) error {
 	structFP := addressFingerprint(inst)
 
 	cur, exists := m.ifaces[inst.Id]
+	if exists && cur.kern != nil {
+		applyV6Aliases(diffV6Aliases(cur.inst, amneziawg.Instance{}))
+		cur.close()
+		delete(m.ifaces, inst.Id)
+		exists = false
+	}
 	// Captured before either branch below: peers/AllowedIPs can change
 	// (and so can each peer's IPv6 alias) without the address/MTU
 	// fingerprint changing at all, so both the reconfigure-in-place branch
@@ -325,6 +345,18 @@ func (m *Manager) HasRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.ifaces) > 0
+}
+
+// kernelName returns the kernel interface name for inbound id, when that
+// inbound is running on the kernel module rather than the embedded device.
+func (m *Manager) kernelName(id int) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, exists := m.ifaces[id]
+	if !exists || cur.kern == nil {
+		return "", false
+	}
+	return cur.kern.name, true
 }
 
 // Lookup returns the running device and current peer snapshot for diagnostics,

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -65,7 +64,7 @@ func SocksInboundSettings(emails []string, password string) ([]byte, error) {
 // Blocks until the relay ends; meant to be called from (or as) an
 // AttachTCPForwarder handler, which already runs each connection on its own
 // goroutine.
-func (r SocksRelay) RelayTCP(conn *gonet.TCPConn, email string, dest netip.AddrPort) {
+func (r SocksRelay) RelayTCP(conn net.Conn, email string, dest netip.AddrPort) {
 	defer conn.Close()
 
 	auth := &proxy.Auth{User: email, Password: r.Password}
@@ -381,6 +380,9 @@ func splitSocks5Addr(b []byte, atyp byte) (netip.Addr, []byte, error) {
 type UDPRelay struct {
 	relay  SocksRelay
 	gstack *stack.Stack
+	// reply, when set, writes a decapsulated payload back to the peer.
+	// Kernel mode has no gVisor stack; nil keeps WriteUDPReply.
+	reply func(from, to netip.AddrPort, payload []byte) error
 
 	// Keyed by the comparable netip.AddrPort, like udpForwardListener's own
 	// session map: src.String() would allocate on every relayed datagram.
@@ -449,8 +451,14 @@ func (u *UDPRelay) pump(src netip.AddrPort, sess *socks5UDPSession) {
 		if err != nil {
 			return
 		}
-		if err := WriteUDPReply(u.gstack, from, src, payload); err != nil {
-			logger.Warningf("amneziawgnet: UDPRelay: reply write: %v", err)
+		var werr error
+		if u.reply != nil {
+			werr = u.reply(from, src, payload)
+		} else {
+			werr = WriteUDPReply(u.gstack, from, src, payload)
+		}
+		if werr != nil {
+			logger.Warningf("amneziawgnet: UDPRelay: reply write: %v", werr)
 		}
 	}
 }

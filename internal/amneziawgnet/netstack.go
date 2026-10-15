@@ -1,5 +1,5 @@
-// Package amneziawgnet embeds amneziawg-go and gVisor netstack in-process
-// as a userspace alternative to kernel wireguard / awg-quick.
+// Package amneziawgnet runs AmneziaWG in-process (amneziawg-go over gVisor) or,
+// when XUI_AWG_BACKEND=kernel, on the host amneziawg module inside this netns.
 package amneziawgnet
 
 import (

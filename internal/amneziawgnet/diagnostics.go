@@ -37,6 +37,7 @@ func (c ClientDiagnostic) Connected() bool {
 // reads the already-running Device's own UAPI dump, never writes to it.
 type Diagnostics struct {
 	Running    bool
+	Backend    string
 	ListenPort int
 	Clients    []ClientDiagnostic
 }
@@ -48,11 +49,21 @@ type Diagnostics struct {
 // instance for this id right now -- disabled, not yet reconciled, or never
 // started -- which is itself useful information for an admin, not an error.
 func Diagnose(id int, peers []amneziawg.Peer) Diagnostics {
+	if name, ok := GetManager().kernelName(id); ok {
+		dump, err := kernelDump(name)
+		if err != nil {
+			return Diagnostics{Running: true, Backend: string(BackendKernel)}
+		}
+		return parseWGDump(dump, peers)
+	}
 	dev, _, ok := GetManager().Lookup(id)
 	if !ok {
-		return Diagnostics{}
+		backend, _ := detectBackend()
+		return Diagnostics{Backend: string(backend)}
 	}
-	return diagnoseDevice(dev, peers)
+	diag := diagnoseDevice(dev, peers)
+	diag.Backend = string(BackendUserspace)
+	return diag
 }
 
 func diagnoseDevice(dev *Device, peers []amneziawg.Peer) Diagnostics {
