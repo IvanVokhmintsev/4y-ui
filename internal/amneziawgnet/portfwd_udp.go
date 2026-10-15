@@ -25,7 +25,7 @@ const portForwardUDPIdleTimeout = 2 * time.Minute
 // endpoint (DialUDP with a non-nil raddr), so plain Read/Write, not
 // ReadFrom/WriteTo, address it correctly.
 type udpForwardSession struct {
-	conn *gonet.UDPConn
+	conn net.Conn
 }
 
 // udpForwardListener is one open host-facing UDP socket for a single
@@ -45,7 +45,7 @@ type udpForwardListener struct {
 // starts demultiplexing datagrams into per-source-address tunnel sessions
 // toward target(key.email). Bind-failure contract matches
 // listenPortForwardTCP exactly: log, return nil, Reconcile retries later.
-func listenPortForwardUDP(gstack *stack.Stack, inboundID int, key portForwardKey, target portForwardTargetFunc) *udpForwardListener {
+func listenPortForwardUDP(gstack *stack.Stack, hostDial bool, inboundID int, key portForwardKey, target portForwardTargetFunc) *udpForwardListener {
 	pc, err := (&net.ListenConfig{}).ListenPacket(context.Background(), "udp", net.JoinHostPort(wildcardBindHost, strconv.Itoa(key.port)))
 	if err != nil {
 		logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: listen udp :%d: %v", inboundID, key.email, key.port, err)
@@ -53,11 +53,11 @@ func listenPortForwardUDP(gstack *stack.Stack, inboundID int, key portForwardKey
 	}
 	l := &udpForwardListener{pc: pc, sessions: map[netip.AddrPort]*udpForwardSession{}}
 	logger.Infof("amneziawgnet: port-forward: inbound %d peer %q: listening udp :%d", inboundID, key.email, key.port)
-	go l.readLoop(gstack, inboundID, key, target)
+	go l.readLoop(gstack, hostDial, inboundID, key, target)
 	return l
 }
 
-func (l *udpForwardListener) readLoop(gstack *stack.Stack, inboundID int, key portForwardKey, target portForwardTargetFunc) {
+func (l *udpForwardListener) readLoop(gstack *stack.Stack, hostDial bool, inboundID int, key portForwardKey, target portForwardTargetFunc) {
 	buf := make([]byte, 65536)
 	for {
 		n, from, err := l.pc.ReadFrom(buf)
@@ -78,8 +78,7 @@ func (l *udpForwardListener) readLoop(gstack *stack.Stack, inboundID int, key po
 			if !ok {
 				continue
 			}
-			raddr := tunnelFullAddress(addr, key.port)
-			conn, err := gonet.DialUDP(gstack, nil, &raddr, tunnelNetwork(addr))
+			conn, err := dialForwardUDP(hostDial, gstack, addr, key.port)
 			if err != nil {
 				logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: dial tunnel %s:%d: %v", inboundID, key.email, addr, key.port, err)
 				continue
@@ -121,6 +120,14 @@ func (l *udpForwardListener) pump(src netip.AddrPort, sess *udpForwardSession) {
 			return
 		}
 	}
+}
+
+func dialForwardUDP(hostDial bool, gstack *stack.Stack, addr netip.Addr, port int) (net.Conn, error) {
+	if hostDial {
+		return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(addr, uint16(port))))
+	}
+	raddr := tunnelFullAddress(addr, port)
+	return gonet.DialUDP(gstack, nil, &raddr, tunnelNetwork(addr))
 }
 
 // Close tears down every open session and the underlying socket.

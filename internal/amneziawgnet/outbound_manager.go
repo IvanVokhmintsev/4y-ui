@@ -20,8 +20,21 @@ type OutboundDesired struct {
 // (no-op/reconfigure decision) and an address/MTU fingerprint.
 type managedOutbound struct {
 	dev        *Device
+	ifname     string
 	uapiConfig string
 	structFP   string
+}
+
+func (o *managedOutbound) shutdown(tag string) {
+	if o.ifname != "" {
+		_ = kernelLinkDel(o.ifname)
+		GetEgressServer().DeleteKernel(tag)
+		return
+	}
+	if o.dev != nil {
+		o.dev.Close()
+	}
+	GetEgressServer().DeleteStack(tag)
 }
 
 // OutboundManager owns the running AmneziaWG client interfaces keyed by tag,
@@ -62,8 +75,7 @@ func (m *OutboundManager) Reconcile(desired []OutboundDesired) {
 	// the egress port stays free on installs without AWG outbounds.
 	if len(desired) == 0 {
 		for tag, cur := range m.iface {
-			cur.dev.Close()
-			GetEgressServer().DeleteStack(tag)
+			cur.shutdown(tag)
 			delete(m.iface, tag)
 			logger.Infof("amneziawgnet: stopped embedded outbound %q", tag)
 		}
@@ -83,8 +95,7 @@ func (m *OutboundManager) Reconcile(desired []OutboundDesired) {
 		if _, ok := want[tag]; ok {
 			continue
 		}
-		cur.dev.Close()
-		GetEgressServer().DeleteStack(tag)
+		cur.shutdown(tag)
 		delete(m.iface, tag)
 		logger.Infof("amneziawgnet: stopped embedded outbound %q", tag)
 	}
@@ -99,6 +110,13 @@ func (m *OutboundManager) Reconcile(desired []OutboundDesired) {
 // ensureLocked picks no-op / reconfigure-in-place / rebuild for one desired
 // outbound (address/MTU are fixed at netstack build time).
 func (m *OutboundManager) ensureLocked(d OutboundDesired) error {
+	backend, err := detectBackend()
+	if err != nil {
+		return err
+	}
+	if backend == BackendKernel {
+		return m.ensureKernelOutbound(d)
+	}
 	inst, opts := d.Instance, d.Options
 	if opts.Logger == nil {
 		opts.Logger = verboseLoggerIfEnabled(0)
@@ -111,6 +129,11 @@ func (m *OutboundManager) ensureLocked(d OutboundDesired) error {
 	}
 
 	cur, exists := m.iface[inst.Tag]
+	if exists && cur.ifname != "" {
+		cur.shutdown(inst.Tag)
+		delete(m.iface, inst.Tag)
+		exists = false
+	}
 	if exists && cur.structFP == fp {
 		if conf == cur.uapiConfig {
 			GetEgressServer().SetStack(inst.Tag, cur.dev, inst.DNS)
@@ -125,9 +148,8 @@ func (m *OutboundManager) ensureLocked(d OutboundDesired) error {
 	}
 
 	if exists {
-		cur.dev.Close()
 		// A failed rebuild must not leave stackFor handing out a closed device.
-		GetEgressServer().DeleteStack(inst.Tag)
+		cur.shutdown(inst.Tag)
 		delete(m.iface, inst.Tag)
 	}
 	dev, err := newUnconfiguredClientDevice(inst, opts)
@@ -151,8 +173,7 @@ func (m *OutboundManager) Remove(tag string) {
 	if !exists {
 		return
 	}
-	cur.dev.Close()
-	GetEgressServer().DeleteStack(tag)
+	cur.shutdown(tag)
 	delete(m.iface, tag)
 	logger.Infof("amneziawgnet: stopped embedded outbound %q", tag)
 }
@@ -163,8 +184,7 @@ func (m *OutboundManager) StopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for tag, cur := range m.iface {
-		cur.dev.Close()
-		GetEgressServer().DeleteStack(tag)
+		cur.shutdown(tag)
 		delete(m.iface, tag)
 	}
 	GetEgressServer().Close()

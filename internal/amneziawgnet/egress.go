@@ -28,7 +28,8 @@ const EgressBasePort = 64900
 type socks5EgressServer struct {
 	mu      sync.Mutex
 	stacks  map[string]*Device // outbound tag -> its device
-	dns     map[string]string  // outbound tag -> its DNS server
+	kernels map[string]kernelEgress
+	dns     map[string]string // outbound tag -> its DNS server
 	tracked map[net.Conn]struct{}
 
 	// dnsServer resolves domain targets through the outbound netstack.
@@ -49,6 +50,7 @@ func GetEgressServer() *socks5EgressServer {
 	egressOnce.Do(func() {
 		egressServer = &socks5EgressServer{
 			stacks:  map[string]*Device{},
+			kernels: map[string]kernelEgress{},
 			dns:     map[string]string{},
 			tracked: map[net.Conn]struct{}{},
 		}
@@ -85,6 +87,7 @@ func (s *socks5EgressServer) SetStack(tag string, dev *Device, dnsServer ...stri
 	prevDev := s.stacks[tag]
 	prevDNS := s.dns[tag]
 	s.stacks[tag] = dev
+	delete(s.kernels, tag)
 	if norm != "" {
 		s.dns[tag] = norm
 	} else {
@@ -101,6 +104,7 @@ func (s *socks5EgressServer) SetStack(tag string, dev *Device, dnsServer ...stri
 func (s *socks5EgressServer) DeleteStack(tag string) {
 	s.mu.Lock()
 	delete(s.stacks, tag)
+	delete(s.kernels, tag)
 	delete(s.dns, tag)
 	s.mu.Unlock()
 	flushTunnelDNSCacheForTag(tag)
@@ -287,6 +291,10 @@ func (s *socks5EgressServer) handleConn(conn net.Conn) {
 
 	switch req[1] {
 	case 0x01: // CONNECT
+		if k, ok := s.kernelFor(user); ok {
+			s.serveKernelTCP(k, user, conn, target)
+			return
+		}
 		dev, ok := s.stackFor(user)
 		if !ok {
 			writeSocksReply(conn, 0x05, netip.AddrPort{})
@@ -300,6 +308,10 @@ func (s *socks5EgressServer) handleConn(conn net.Conn) {
 		}
 		s.relayTCP(dev, user, conn, dest)
 	case 0x03: // UDP ASSOCIATE
+		if k, ok := s.kernelFor(user); ok {
+			s.serveKernelUDP(k, user, udpControl{conn: conn}, target)
+			return
+		}
 		dev, ok := s.stackFor(user)
 		if !ok {
 			writeSocksReply(conn, 0x05, netip.AddrPort{})
@@ -451,7 +463,7 @@ type udpControl struct{ conn net.Conn }
 // connected tunnel endpoint whose source port makes replies answerable.
 type egressUDPSession struct {
 	dst  netip.AddrPort
-	conn *gonet.UDPConn
+	conn net.Conn
 }
 
 // relayUDP answers the associate request and relays datagrams to

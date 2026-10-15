@@ -13,9 +13,9 @@ services:
     # and shown in fail2ban status but never actually applied. NET_RAW covers
     # ip6tables. If you disable Fail2ban, you can drop cap_add.
     #
-    # AmneziaWG works in this image: it runs embedded in the panel process
-    # (amneziawg-go over a gVisor userspace netstack), so it needs no kernel
-    # module and no host tooling. Publish its UDP listen port to use it.
+    # AmneziaWG defaults to the in-process userspace engine. For the kernel
+    # module, load it on the host (`modprobe amneziawg`) and set
+    # XUI_AWG_BACKEND=auto or kernel. Publish the inbound's UDP listen port.
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -28,6 +28,7 @@ services:
     environment:
       XRAY_VMESS_AEAD_FORCED: "false"
       XUI_ENABLE_FAIL2BAN: "true"
+      # XUI_AWG_BACKEND: "auto"
       # Memory tuning. The panel keeps RAM low via GOGC + periodic release; it no
       # longer sets a soft limit from total host RAM (no benefit, risks GC thrash).
       # XUI_GOGC: "75"              # lower = less RAM, slightly more CPU; GOGC env overrides

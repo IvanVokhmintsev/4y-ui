@@ -89,6 +89,9 @@ type portForwardListener interface {
 type PortForwardSet struct {
 	gstack    *stack.Stack
 	inboundID int
+	// hostDial reaches the peer with a normal socket. Kernel mode has a real
+	// route to the tunnel address; the embedded path dials the netstack.
+	hostDial bool
 
 	mu          sync.Mutex
 	peerTargets map[string]netip.Addr
@@ -104,6 +107,13 @@ func NewPortForwardSet(gstack *stack.Stack, inboundID int) *PortForwardSet {
 		peerTargets: map[string]netip.Addr{},
 		listeners:   map[portForwardKey]portForwardListener{},
 	}
+}
+
+// NewHostPortForwardSet forwards through the kernel route to the peer address.
+func NewHostPortForwardSet(inboundID int) *PortForwardSet {
+	set := NewPortForwardSet(nil, inboundID)
+	set.hostDial = true
+	return set
 }
 
 // desiredPeerTargets resolves each peer's tunnel-internal target address:
@@ -214,7 +224,7 @@ func (s *PortForwardSet) Reconcile(inst amneziawg.Instance) {
 		ln.Close()
 	}
 	for _, key := range toOpen {
-		ln := openPortForwardListener(s.gstack, s.inboundID, key, s.targetFor)
+		ln := openPortForwardListener(s.gstack, s.hostDial, s.inboundID, key, s.targetFor)
 		if ln == nil {
 			continue
 		}
@@ -254,18 +264,25 @@ func (s *PortForwardSet) Close() {
 // into the portForwardListener interface would be a non-nil interface
 // holding a nil pointer, Go's classic trap, so the concrete pointer is
 // checked before it's ever assigned into the interface-typed return.
-func openPortForwardListener(gstack *stack.Stack, inboundID int, key portForwardKey, target portForwardTargetFunc) portForwardListener {
+func openPortForwardListener(gstack *stack.Stack, hostDial bool, inboundID int, key portForwardKey, target portForwardTargetFunc) portForwardListener {
 	switch key.proto {
 	case tcpForward:
-		if ln := listenPortForwardTCP(gstack, inboundID, key, target); ln != nil {
+		if ln := listenPortForwardTCP(gstack, hostDial, inboundID, key, target); ln != nil {
 			return ln
 		}
 	case udpForward:
-		if ln := listenPortForwardUDP(gstack, inboundID, key, target); ln != nil {
+		if ln := listenPortForwardUDP(gstack, hostDial, inboundID, key, target); ln != nil {
 			return ln
 		}
 	}
 	return nil
+}
+
+func dialForwardTCP(ctx context.Context, hostDial bool, gstack *stack.Stack, addr netip.Addr, port int) (net.Conn, error) {
+	if hostDial {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), strconv.Itoa(port)))
+	}
+	return gonet.DialContextTCP(ctx, gstack, tunnelFullAddress(addr, port), tunnelNetwork(addr))
 }
 
 const portForwardDialTimeout = 10 * time.Second
@@ -303,7 +320,7 @@ type tcpForwardListener struct {
 // claimed the same port) is logged and returns nil; Reconcile treats a nil
 // result as "not open this round" and retries on every future Reconcile
 // call for as long as the key stays desired.
-func listenPortForwardTCP(gstack *stack.Stack, inboundID int, key portForwardKey, target portForwardTargetFunc) *tcpForwardListener {
+func listenPortForwardTCP(gstack *stack.Stack, hostDial bool, inboundID int, key portForwardKey, target portForwardTargetFunc) *tcpForwardListener {
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", net.JoinHostPort(wildcardBindHost, strconv.Itoa(key.port)))
 	if err != nil {
 		logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: listen tcp :%d: %v", inboundID, key.email, key.port, err)
@@ -311,11 +328,11 @@ func listenPortForwardTCP(gstack *stack.Stack, inboundID int, key portForwardKey
 	}
 	l := &tcpForwardListener{ln: ln, closing: make(chan struct{})}
 	logger.Infof("amneziawgnet: port-forward: inbound %d peer %q: listening tcp :%d", inboundID, key.email, key.port)
-	go l.acceptLoop(gstack, inboundID, key, target)
+	go l.acceptLoop(gstack, hostDial, inboundID, key, target)
 	return l
 }
 
-func (l *tcpForwardListener) acceptLoop(gstack *stack.Stack, inboundID int, key portForwardKey, target portForwardTargetFunc) {
+func (l *tcpForwardListener) acceptLoop(gstack *stack.Stack, hostDial bool, inboundID int, key portForwardKey, target portForwardTargetFunc) {
 	for {
 		conn, err := l.ln.Accept()
 		if err != nil {
@@ -327,11 +344,11 @@ func (l *tcpForwardListener) acceptLoop(gstack *stack.Stack, inboundID int, key 
 			logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: accept tcp :%d: %v", inboundID, key.email, key.port, err)
 			return
 		}
-		go relayTCPForward(gstack, conn, inboundID, key, target)
+		go relayTCPForward(gstack, hostDial, conn, inboundID, key, target)
 	}
 }
 
-func relayTCPForward(gstack *stack.Stack, conn net.Conn, inboundID int, key portForwardKey, target portForwardTargetFunc) {
+func relayTCPForward(gstack *stack.Stack, hostDial bool, conn net.Conn, inboundID int, key portForwardKey, target portForwardTargetFunc) {
 	defer conn.Close()
 	addr, ok := target(key.email)
 	if !ok {
@@ -339,7 +356,7 @@ func relayTCPForward(gstack *stack.Stack, conn net.Conn, inboundID int, key port
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), portForwardDialTimeout)
 	defer cancel()
-	tunnelConn, err := gonet.DialContextTCP(ctx, gstack, tunnelFullAddress(addr, key.port), tunnelNetwork(addr))
+	tunnelConn, err := dialForwardTCP(ctx, hostDial, gstack, addr, key.port)
 	if err != nil {
 		logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: dial tunnel %s:%d: %v", inboundID, key.email, addr, key.port, err)
 		return
